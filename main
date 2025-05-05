@@ -1,0 +1,518 @@
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+import scipy.stats
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import matplotlib.pyplot as plt
+import os
+from datetime import datetime
+
+
+class LiquidVolumePredictor:
+    def __init__(self, window_size=30):
+        self.window_size = window_size
+        self.model = None
+        self.scaler_X = MinMaxScaler()
+        self.scaler_y = MinMaxScaler()
+        # 为小体积添加权重
+        self.volume_mapping = {
+            '20ml+50ml': {'volume': 70, 'weight': 2.0},
+            '30ml+60ml': {'volume': 90, 'weight': 2.0},
+            '100ml+150ml': {'volume': 250, 'weight': 1.0},
+            '150ml+200ml': {'volume': 350, 'weight': 1.0},
+            '200ml+250ml': {'volume': 450, 'weight': 1.2}
+        }
+
+    def add_features(self, window):
+        """增强特征工程，特别关注小体积的特征"""
+        # 基础统计特征
+        basic_stats = np.array([
+            np.mean(window),
+            np.std(window),
+            np.median(window),
+            np.max(window),
+            np.min(window),
+            np.ptp(window)  # 峰峰值
+        ])
+
+        # 趋势特征
+        diffs = np.diff(window)
+        trend_features = np.array([
+            np.mean(diffs),
+            np.std(diffs),
+            np.sum(diffs > 0),
+            np.sum(diffs < 0),
+            np.median(diffs)
+        ])
+
+        # 高阶统计特征
+        high_order_stats = np.array([
+            np.var(window),  # 方差
+            scipy.stats.skew(window),  # 偏度
+            scipy.stats.kurtosis(window),  # 峰度
+            scipy.stats.entropy(np.abs(window))  # 熵
+        ])
+
+        # 分段统计特征
+        segment_size = len(window) // 3
+        segments = [
+            window[:segment_size],
+            window[segment_size:2 * segment_size],
+            window[2 * segment_size:]
+        ]
+        segment_features = []
+        for seg in segments:
+            segment_features.extend([
+                np.mean(seg),
+                np.std(seg),
+                np.median(seg)
+            ])
+
+        return np.concatenate([
+            basic_stats,
+            trend_features,
+            high_order_stats,
+            segment_features
+        ])
+
+    def prepare_data(self, file_path, test_size=0.2):
+        """改进的数据准备方法，增加小体积样本的权重"""
+        print("开始准备数据...")
+        df = pd.read_excel(file_path)
+
+        X_all = []
+        y_all = []
+        weights_all = []
+        volume_labels = []
+
+        for column, info in self.volume_mapping.items():
+            volume = info['volume']
+            weight = info['weight']
+            data = df[column].values
+            print(f"处理 {column} 数据, 目标体积: {volume}ml, 权重: {weight}")
+
+            # 对小体积使用更小的步长
+            step = max(1, self.window_size // 20) if volume < 100 else max(1, self.window_size // 10)
+
+            for i in range(0, len(data) - self.window_size + 1, step):
+                window = data[i:i + self.window_size]
+                features = self.add_features(window)
+
+                # 添加位置信息
+                position = i / len(data)
+                features = np.append(features, position)
+
+                X_all.append(features)
+                y_all.append(volume)
+                weights_all.append(weight)
+                volume_labels.append(str(volume))
+
+        X = np.array(X_all)
+        y = np.array(y_all).reshape(-1, 1)
+        weights = np.array(weights_all)
+
+        # 归一化
+        X_scaled = self.scaler_X.fit_transform(X)
+        y_scaled = self.scaler_y.fit_transform(y)
+
+        # 分层分割数据
+        X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(
+            X_scaled, y_scaled, weights,
+            test_size=test_size,
+            random_state=42,
+            stratify=volume_labels
+        )
+
+        return X_train, X_test, y_train, y_test, w_train, w_test
+
+    def build_model(self, input_shape):
+        """改进的模型结构，特别关注小体积预测"""
+        model = Sequential([
+            Dense(512, activation='elu', input_shape=(input_shape,),
+                  kernel_regularizer=l2(0.001),
+                  kernel_initializer='he_normal'),
+            BatchNormalization(),
+            Dropout(0.3),
+
+            Dense(256, activation='elu',
+                  kernel_regularizer=l2(0.001)),
+            BatchNormalization(),
+            Dropout(0.3),
+
+            Dense(128, activation='elu',
+                  kernel_regularizer=l2(0.001)),
+            BatchNormalization(),
+            Dropout(0.2),
+
+            Dense(64, activation='elu',
+                  kernel_regularizer=l2(0.001)),
+            BatchNormalization(),
+            Dropout(0.2),
+
+            Dense(32, activation='elu',
+                  kernel_regularizer=l2(0.001)),
+            BatchNormalization(),
+            Dropout(0.1),
+
+            Dense(1, activation='linear')
+        ])
+
+        # 自定义损失函数，对小体积加权
+        def weighted_loss(y_true, y_pred, sample_weight=None):
+            error = y_true - y_pred
+            is_small = tf.abs(y_true) < 0.3  # 归一化后的小体积阈值
+
+            loss = tf.square(error)  # MSE
+            if sample_weight is not None:
+                loss *= sample_weight
+
+            # 对小体积的误差加大权重
+            loss = tf.where(is_small, loss * 2.0, loss)
+            return tf.reduce_mean(loss)
+
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+            loss=weighted_loss,
+            metrics=['mae', 'mse']
+        )
+
+        return model
+
+    def train(self, X_train, y_train, sample_weights, epochs=150, batch_size=32):
+        """改进的训练过程"""
+        X_train_main, X_val, y_train_main, y_val, w_train_main, w_val = train_test_split(
+            X_train, y_train, sample_weights,
+            test_size=0.2,
+            random_state=42
+        )
+
+        callbacks = [
+            EarlyStopping(
+                monitor='val_loss',
+                patience=20,
+                restore_best_weights=True,
+                verbose=1
+            ),
+            ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.2,
+                patience=10,
+                min_lr=0.000001,
+                verbose=1
+            )
+        ]
+
+        history = self.model.fit(
+            X_train_main, y_train_main,
+            sample_weight=w_train_main,
+            validation_data=(X_val, y_val, w_val),
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=callbacks,
+            verbose=1
+        )
+
+        return history
+
+    def evaluate_predictions(self, X_test, y_test):
+        """分体积评估预测结果"""
+        y_pred_scaled = self.model.predict(X_test, verbose=0)
+        y_test_orig = self.scaler_y.inverse_transform(y_test)
+        y_pred_orig = self.scaler_y.inverse_transform(y_pred_scaled)
+
+        metrics = {}
+        for volume in [v['volume'] for v in self.volume_mapping.values()]:
+            tolerance = 5 if volume < 100 else 10
+            mask = (y_test_orig >= volume - tolerance) & (y_test_orig <= volume + tolerance)
+
+            if np.any(mask):
+                y_true_vol = y_test_orig[mask]
+                y_pred_vol = y_pred_orig[mask]
+
+                metrics[volume] = {
+                    'mse': np.mean((y_true_vol - y_pred_vol) ** 2),
+                    'rmse': np.sqrt(np.mean((y_true_vol - y_pred_vol) ** 2)),
+                    'mae': np.mean(np.abs(y_true_vol - y_pred_vol)),
+                    'mape': np.mean(np.abs((y_true_vol - y_pred_vol) / y_true_vol)) * 100,
+                    'samples': len(y_true_vol)
+                }
+
+        return y_test_orig, y_pred_orig, metrics
+
+    def plot_results(self, y_true, y_pred):
+        """改进的可视化方法"""
+        plt.figure(figsize=(12, 8))
+
+        # 为每个体积范围使用不同的颜色
+        volumes = sorted([v['volume'] for v in self.volume_mapping.values()])
+        colors = ['b', 'g', 'r', 'c', 'm']
+
+        for volume, color in zip(volumes, colors):
+            tolerance = 5 if volume < 100 else 10
+            mask = (y_true >= volume - tolerance) & (y_true <= volume + tolerance)
+            plt.scatter(y_true[mask], y_pred[mask],
+                        alpha=0.5, color=color,
+                        label=f'{volume}ml')
+
+        # 添加对角线
+        from pylab import mpl
+        mpl.rcParams["font.sans-serif"] = ["SimHei"]  # 设置显示中文字体
+        mpl.rcParams["axes.unicode_minus"] = False  # 设置正常显示符号
+        min_val = min(y_true.min(), y_pred.min())
+        max_val = max(y_true.max(), y_pred.max())
+        plt.plot([min_val, max_val], [min_val, max_val], 'k--',
+                 label='理想预测线')
+
+        plt.xlabel('实际液体量 (ml)')
+        plt.ylabel('预测液体量 (ml)')
+        plt.title('液体量预测结果')
+        plt.grid(True)
+        plt.legend()
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        plt.savefig(f'prediction_results_{timestamp}.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def prepare_data(self, file_path, test_size=0.2, val_samples_per_volume=10):
+        """准备训练、验证和测试数据，每种液体量选择固定数量的验证样本"""
+        print("开始准备数据...")
+        df = pd.read_excel(file_path)
+
+        X_all = []
+        y_all = []
+        weights_all = []
+        volume_labels = []
+
+        # 存储每种体积的数据
+        volume_data = {vol_info['volume']: {'X': [], 'y': [], 'w': []}
+                       for vol_info in self.volume_mapping.values()}
+
+        for column, info in self.volume_mapping.items():
+            volume = info['volume']
+            weight = info['weight']
+            data = df[column].values
+            print(f"处理 {column} 数据, 目标体积: {volume}ml, 权重: {weight}")
+
+            step = max(1, self.window_size // 20) if volume < 100 else max(1, self.window_size // 10)
+
+            for i in range(0, len(data) - self.window_size + 1, step):
+                window = data[i:i + self.window_size]
+                features = self.add_features(window)
+                position = i / len(data)
+                features = np.append(features, position)
+
+                volume_data[volume]['X'].append(features)
+                volume_data[volume]['y'].append(volume)
+                volume_data[volume]['w'].append(weight)
+
+        # 分别处理每种体积的数据
+        X_train_all = []
+        X_val_all = []
+        X_test_all = []
+        y_train_all = []
+        y_val_all = []
+        y_test_all = []
+        w_train_all = []
+        w_val_all = []
+        w_test_all = []
+
+        for volume, data in volume_data.items():
+            X = np.array(data['X'])
+            y = np.array(data['y'])
+            w = np.array(data['w'])
+
+            # 随机选择验证样本
+            indices = np.arange(len(X))
+            np.random.shuffle(indices)
+
+            val_indices = indices[:val_samples_per_volume]
+            remaining_indices = indices[val_samples_per_volume:]
+
+            # 分割剩余数据为训练集和测试集
+            train_indices, test_indices = train_test_split(
+                remaining_indices,
+                test_size=test_size,
+                random_state=42
+            )
+
+            # 添加到对应的列表中
+            X_train_all.append(X[train_indices])
+            X_val_all.append(X[val_indices])
+            X_test_all.append(X[test_indices])
+
+            y_train_all.append(y[train_indices])
+            y_val_all.append(y[val_indices])
+            y_test_all.append(y[test_indices])
+
+            w_train_all.append(w[train_indices])
+            w_val_all.append(w[val_indices])
+            w_test_all.append(w[test_indices])
+
+        # 合并数据
+        X_train = np.vstack(X_train_all)
+        X_val = np.vstack(X_val_all)
+        X_test = np.vstack(X_test_all)
+
+        y_train = np.concatenate(y_train_all).reshape(-1, 1)
+        y_val = np.concatenate(y_val_all).reshape(-1, 1)
+        y_test = np.concatenate(y_test_all).reshape(-1, 1)
+
+        w_train = np.concatenate(w_train_all)
+        w_val = np.concatenate(w_val_all)
+        w_test = np.concatenate(w_test_all)
+
+        # 归一化
+        X_train_scaled = self.scaler_X.fit_transform(X_train)
+        X_val_scaled = self.scaler_X.transform(X_val)
+        X_test_scaled = self.scaler_X.transform(X_test)
+
+        y_train_scaled = self.scaler_y.fit_transform(y_train)
+        y_val_scaled = self.scaler_y.transform(y_val)
+        y_test_scaled = self.scaler_y.transform(y_test)
+
+        return (X_train_scaled, X_val_scaled, X_test_scaled,
+                y_train_scaled, y_val_scaled, y_test_scaled,
+                w_train, w_val, w_test)
+
+    def plot_validation_results(self, y_true, y_pred, title='验证集预测结果'):
+        """绘制验证集的预测结果"""
+        plt.figure(figsize=(12, 8))
+
+        # 为每个体积范围使用不同的颜色和标记
+        volumes = sorted([v['volume'] for v in self.volume_mapping.values()])
+        colors = ['b', 'g', 'r', 'c', 'm']
+        markers = ['o', 's', '^', 'D', 'v']
+
+        for volume, color, marker in zip(volumes, colors, markers):
+            # 对小体积使用更小的容差
+            tolerance = 5 if volume < 100 else 10
+            mask = (y_true >= volume - tolerance) & (y_true <= volume + tolerance)
+
+            if np.any(mask):
+                plt.scatter(y_true[mask], y_pred[mask],
+                            alpha=0.7, color=color, marker=marker,
+                            s=100, label=f'{volume}ml')
+
+                # 添加误差标签
+                mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+                rmse = np.sqrt(np.mean((y_true[mask] - y_pred[mask]) ** 2))
+                plt.annotate(f'MAPE: {mape:.1f}%\nRMSE: {rmse:.1f}ml',
+                             xy=(np.mean(y_true[mask]), np.mean(y_pred[mask])),
+                             xytext=(10, 10), textcoords='offset points',
+                             bbox=dict(facecolor='white', alpha=0.7))
+
+        # 添加对角线
+        min_val = min(y_true.min(), y_pred.min())
+        max_val = max(y_true.max(), y_pred.max())
+        from pylab import mpl
+        mpl.rcParams["font.sans-serif"] = ["SimHei"]  # 设置显示中文字体
+        mpl.rcParams["axes.unicode_minus"] = False  # 设置正常显示符号
+        plt.plot([min_val, max_val], [min_val, max_val], 'k--',
+                 label='理想预测线')
+
+        plt.xlabel('实际液体量 (ml)')
+        plt.ylabel('预测液体量 (ml)')
+        plt.title(title)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+
+        # 保存图片
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        plt.savefig(f'validation_results_{timestamp}.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+
+def main():
+    # 设置随机种子
+    np.random.seed(42)
+    tf.random.set_seed(42)
+
+    try:
+        # 创建输出目录
+        if not os.path.exists('output'):
+            os.makedirs('output')
+
+        # 创建预测器实例
+        predictor = LiquidVolumePredictor(window_size=30)
+
+        # 加载数据
+        print("正在加载数据...")
+        file_path = 'diaper_data22.xlsx'
+
+        # 准备数据
+        print("\n准备训练数据...")
+        (X_train, X_val, X_test,
+         y_train, y_val, y_test,
+         w_train, w_val, w_test) = predictor.prepare_data(
+            file_path,
+            val_samples_per_volume=10  # 每种液体量选择10个验证样本
+        )
+
+        # 构建模型
+        print("\n构建模型...")
+        predictor.model = predictor.build_model(X_train.shape[1])
+        predictor.model.summary()
+
+        # 训练模型
+        print("\n开始训练模型...")
+        history = predictor.train(
+            X_train, y_train, w_train,
+            epochs=120,
+            batch_size=32
+        )
+        # 评估模型
+        print("\n评估模型性能...")
+        y_true, y_pred, metrics = predictor.evaluate_predictions(X_test, y_test)
+
+        # 打印每种液体量的评估结果
+        for volume, metric in metrics.items():
+            print(f"\n{volume}ml 的预测结果:")
+            print(f"样本数量: {metric['samples']}")
+            print(f"均方误差 (MSE): {metric['mse']:.2f}")
+            print(f"均方根误差 (RMSE): {metric['rmse']:.2f} ml")
+            print(f"平均绝对误差 (MAE): {metric['mae']:.2f} ml")
+            print(f"平均绝对百分比误差 (MAPE): {metric['mape']:.2f}%")
+
+        # 绘制结果
+        print("\n绘制预测结果...")
+        predictor.plot_results(y_true, y_pred)
+
+        # 评估验证集
+        print("\n评估验证集性能...")
+        y_val_pred = predictor.model.predict(X_val)
+        y_val_true = predictor.scaler_y.inverse_transform(y_val)
+        y_val_pred = predictor.scaler_y.inverse_transform(y_val_pred)
+
+
+
+        # 绘制验证集结果
+        print("\n绘制验证集预测结果...")
+        predictor.plot_validation_results(y_val_true, y_val_pred, '验证集预测结果')
+
+        print("\n验证集评估结果:")
+        for volume in sorted([v['volume'] for v in predictor.volume_mapping.values()]):
+            tolerance = 5 if volume < 100 else 10
+            mask = (y_val_true >= volume - tolerance) & (y_val_true <= volume + tolerance)
+            if np.any(mask):
+                mape = np.mean(np.abs((y_val_true[mask] - y_val_pred[mask]) / y_val_true[mask])) * 100
+                rmse = np.sqrt(np.mean((y_val_true[mask] - y_val_pred[mask]) ** 2))
+                print(f"\n{volume}ml 的预测结果:")
+                print(f"样本数量: {np.sum(mask)}")
+                print(f"均方根误差 (RMSE): {rmse:.2f} ml")
+                print(f"平均绝对百分比误差 (MAPE): {mape:.2f}%")
+
+        print("\n程序运行完成!")
+
+    except Exception as e:
+        print(f"发生错误: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
